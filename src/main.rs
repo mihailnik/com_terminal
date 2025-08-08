@@ -6,7 +6,7 @@
 
 use iced::executor;
 use iced::widget::{
-    button, container, pick_list, radio, scrollable, text, text_input, Column, Row,
+    button, checkbox, container, pick_list, radio, scrollable, text, text_input, Column, Row,
 };
 use iced::{Alignment, Application, Command, Element, Length, Subscription, Theme};
 use serialport::{available_ports, DataBits, Parity, SerialPort, StopBits};
@@ -27,6 +27,7 @@ struct Terminal {
     // Connection state
     log: Vec<String>,
     port: Option<Arc<Mutex<Box<dyn SerialPort>>>>,
+    show_received_prefix: bool, // Новая настройка для префикса
 
     // UI state for managing ports
     available_ports: Vec<String>,
@@ -50,7 +51,7 @@ enum Message {
     PortSelected(String),
     BaudRateSelected(u32),
     DataBitsSelected(DataBits),
-    StopBitsSelected(StopBits),
+    StopBitsSelected(DataBits),
     ParitySelected(Parity),
     ConnectClicked,
     DisconnectClicked,
@@ -60,6 +61,7 @@ enum Message {
     SendFromFileClicked,
     InputChanged(String),
     InputSubmitted,
+    ToggleReceivedPrefix(bool), // Новое сообщение для флажка
 
     // Serial port related messages
     PortsFound(Result<Vec<String>, String>),
@@ -90,6 +92,7 @@ impl Application for Terminal {
             Terminal {
                 log: vec!["Ожидание подключения...".to_string()],
                 port: None,
+                show_received_prefix: true, // По умолчанию префикс включен
                 available_ports: Vec::new(),
                 selected_port: None,
                 baud_rates: baud_rates.clone(),
@@ -263,7 +266,11 @@ impl Application for Terminal {
                 Command::none()
             }
             Message::SerialDataReceived(data) => {
-                self.log.push(format!("> {}", data));
+                if self.show_received_prefix {
+                    self.log.push(format!("> {}", data));
+                } else {
+                    self.log.push(data);
+                }
                 scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset::END)
             }
             Message::PortConnected(Ok(port_arc)) => {
@@ -279,6 +286,10 @@ impl Application for Terminal {
             Message::SerialError(e) => {
                 self.log.push(format!("Ошибка COM-порта: {}", e));
                 self.port = None;
+                Command::none()
+            }
+            Message::ToggleReceivedPrefix(checked) => {
+                self.show_received_prefix = checked;
                 Command::none()
             }
             // A new message handler to trigger the port scan command.
@@ -386,7 +397,7 @@ impl Application for Terminal {
                     Message::DataBitsSelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(
                 radio(
@@ -396,7 +407,7 @@ impl Application for Terminal {
                     Message::DataBitsSelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(
                 radio(
@@ -406,7 +417,7 @@ impl Application for Terminal {
                     Message::DataBitsSelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(
                 radio(
@@ -416,7 +427,7 @@ impl Application for Terminal {
                     Message::DataBitsSelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(text("Стоп-биты:").size(14))
             .push(
@@ -427,7 +438,7 @@ impl Application for Terminal {
                     Message::StopBitsSelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(
                 radio(
@@ -437,7 +448,7 @@ impl Application for Terminal {
                     Message::StopBitsSelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(text("Четность:").size(14))
             .push(
@@ -448,7 +459,7 @@ impl Application for Terminal {
                     Message::ParitySelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(
                 radio(
@@ -458,7 +469,7 @@ impl Application for Terminal {
                     Message::ParitySelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             )
             .push(
                 radio(
@@ -468,7 +479,7 @@ impl Application for Terminal {
                     Message::ParitySelected,
                 )
                 .text_size(14)
-                .size(16), // <-- Уменьшаем размер самой радиокнопки
+                .size(18), // <-- Уменьшаем размер самой радиокнопки
             );
 
         // Log window and control buttons
@@ -483,10 +494,16 @@ impl Application for Terminal {
             .height(Length::FillPortion(2)) // Исправлена ошибка: 2.0 заменено на 2
             .width(Length::Fill);
 
-        let log_buttons = Row::new()
+        let log_buttons_and_settings = Row::new()
             .spacing(10)
+            .align_items(Alignment::Center)
             .push(button("Сохранить").on_press(Message::SaveLogClicked))
-            .push(button("Очистить").on_press(Message::ClearLogClicked));
+            .push(button("Очистить").on_press(Message::ClearLogClicked))
+            .push(
+                checkbox("Показывать префикс", self.show_received_prefix)
+                    .on_toggle(Message::ToggleReceivedPrefix)
+                    .text_size(14),
+            );
 
         // Text input and send
         let input_row = Row::new()
@@ -515,7 +532,7 @@ impl Application for Terminal {
             .push(controls)
             .push(port_settings)
             .push(log_display)
-            .push(log_buttons)
+            .push(log_buttons_and_settings)
             .push(input_row)
             .push(file_input_row);
 
@@ -537,54 +554,3 @@ async fn find_ports() -> Result<Vec<String>, String> {
 fn main() -> iced::Result {
     Terminal::run(iced::Settings::default())
 }
-
-// 1. Изменение иконки программы
-// Чтобы изменить иконку исполняемого файла (.exe), вам нужно добавить небольшой файл конфигурации в проект, так как Rust сам по себе не обрабатывает иконки.
-
-// Для Windows это делается так:
-
-// Создайте файл с именем build.rs в корневой папке вашего проекта. Этот файл будет автоматически запускаться при компиляции.
-
-// Добавьте в build.rs следующий код:
-
-// Rust
-
-// fn main() {
-//     if cfg!(target_os = "windows") {
-//         let mut res = winres::WindowsResource::new();
-//         res.set_icon("path/to/your/icon.ico");
-//         res.compile().unwrap();
-//     }
-// }
-// Добавьте зависимость winres в ваш файл Cargo.toml:
-
-// Ini, TOML
-
-// [build-dependencies]
-// winres = "0.1"
-// Поместите ваш .ico файл в проект и укажите правильный путь к нему в строке res.set_icon("..."). Например, если файл называется icon.ico и находится в корневой папке, путь будет "icon.ico".
-
-// 2. Уменьшение размера .exe и релиз
-// Ваш текущий исполняемый файл, скорее всего, был собран в режиме отладки (debug). Такие билды содержат много дополнительной информации, полезной для отладчиков, но ненужной для конечного пользователя, поэтому они получаются большими.
-
-// Чтобы создать оптимизированную, более компактную версию:
-
-// Выполните команду cargo build --release. Это создаст оптимизированный .exe файл в папке target/release. Он будет значительно меньше, чем его debug версия.
-
-// Для ещё большего уменьшения размера можно добавить в файл Cargo.toml следующие настройки:
-
-// Ini, TOML
-
-// [profile.release]
-// lto = true
-// codegen-units = 1
-// strip = true
-// lto = true включает Link-Time Optimization, которая позволяет компилятору лучше оптимизировать весь код целиком.
-
-// codegen-units = 1 говорит компилятору не разбивать код на части, что также помогает LTO.
-
-// strip = true удаляет отладочную информацию из исполняемого файла, что сильно уменьшает его размер.
-
-// После добавления этих настроек просто снова запустите cargo build --release.
-
-// Надеюсь, эта информация поможет вам подготовить программу к выпуску!
