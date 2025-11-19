@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 iced = { version = "0.13.1", features = ["advanced", "async-std", "tokio"] }
-serialport = "4.7.2"
+serialport = "4.8.1"
 tokio = { version = "1.47.1", features = ["full"] }
 rfd = "0.15.4"
 tokio-serial = "5.4.5"
