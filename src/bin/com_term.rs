@@ -1,5 +1,4 @@
 #![windows_subsystem = "windows"]
-
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use futures::Stream; // ← саме цей Stream
 use iced::advanced::subscription::{self, Recipe};
@@ -8,7 +7,7 @@ use iced::futures::{self, StreamExt};
 use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
 use iced::{Element, Length, Subscription, Theme};
 // use rustc_hash::FxHasher;
-use iced::Font;
+// use iced::Font;
 use serialport::{available_ports, SerialPort};
 use std::collections::VecDeque;
 use std::hash::Hash;
@@ -72,7 +71,7 @@ impl Default for PortSettings {
     fn default() -> Self {
         Self {
             port_name: None,
-            baud_rate: 9600,
+            baud_rate: 115200,
             connected: false,
         }
     }
@@ -117,6 +116,7 @@ pub struct ComTerminal {
     serial_port: Option<Arc<Mutex<Box<dyn SerialPort>>>>,
     rx: Option<Receiver<Message>>, // нове поле для прийому повідомлень
     tx: Option<Sender<Message>>,
+    write_tx: Option<Sender<String>>, // канал для команд записи в порт
 }
 
 impl ComTerminal {
@@ -135,6 +135,7 @@ impl ComTerminal {
             serial_port: None,
             rx: None,
             tx: None,
+            write_tx: None,
         };
 
         terminal
@@ -150,7 +151,7 @@ impl ComTerminal {
                 if terminal.available_ports.is_empty() {
                     terminal
                         .terminal_output
-                        .push_back("⚠️ COM порти не Знайдено".to_string());
+                        .push_back("! COM порти не Знайдено".to_string());
                 } else {
                     terminal.terminal_output.push_back(format!(
                         "📋 Знайдено портів: {}",
@@ -161,7 +162,7 @@ impl ComTerminal {
             Err(e) => {
                 terminal
                     .terminal_output
-                    .push_back(format!("❌ Помилка отримання списку портів: {}", e));
+                    .push_back(format!("✗ Помилка отримання списку портів: {}", e));
             }
         }
 
@@ -208,7 +209,7 @@ impl ComTerminal {
                             }
                             Err(e) => {
                                 self.terminal_output
-                                    .push_back(format!("❌ Помилка відправлення данних: {}", e));
+                                    .push_back(format!("✗ Помилка відправлення данних: {}", e));
                             }
                         }
                     }
@@ -232,68 +233,114 @@ impl ComTerminal {
                         .timeout(Duration::from_millis(10))
                         .open()
                     {
-                        Ok(port) => {
+                        Ok(mut port) => {
                             self.port_settings.connected = true;
-                            let port_arc = Arc::new(Mutex::new(port));
-                            self.serial_port = Some(port_arc.clone());
 
-                            // створюємо канал
+                            // создаём канал сообщений от потока -> UI
                             let (tx, rx) = unbounded();
                             self.tx = Some(tx.clone());
                             self.rx = Some(rx);
 
-                            // запускаємо окремий потік для читання
+                            // создаём канал команд записи: UI -> поток порта
+                            let (write_tx, write_rx) = unbounded::<String>();
+                            self.write_tx = Some(write_tx.clone());
+
+                            // перезаписываем порт-owned поток: поток владеет `port` (не через Arc/Mutex)
+                            // перемещаем port в поток
                             let port_name_clone = port_name.clone();
+                            let tx_clone = tx.clone();
                             thread::spawn(move || {
                                 let mut buf = [0u8; 1024];
-                                // 🔧 Додай тут — перевіримо, що потік стартував
-                                tx.send(Message::DataReceived(
-                                    "🟡 Потік читання запущено".to_string(),
-                                ))
-                                .ok();
-                                loop {
-                                    let mut lock = port_arc.lock().unwrap();
-                                    tx.send(Message::DataReceived(
-                                        "🔄 Читання з порту...".to_string(),
+
+                                // оповестим UI, что поток запущен
+                                tx_clone
+                                    .send(Message::DataReceived(
+                                        "🟡 Потік читання запущено".to_string(),
                                     ))
                                     .ok();
-                                    match lock.read(&mut buf) {
+
+                                loop {
+                                    // сначала проверим команды на запись (не блокирующе)
+                                    match write_rx.try_recv() {
+                                        Ok(data_to_write) => {
+                                            if let Err(e) = port.write_all(data_to_write.as_bytes())
+                                            {
+                                                tx_clone
+                                                    .send(Message::DataReceived(format!(
+                                                        "✗ Помилка запису: {}",
+                                                        e
+                                                    )))
+                                                    .ok();
+                                            } else {
+                                                // постараемся форсировать отправку из буфера
+                                                let _ = port.flush();
+                                                tx_clone
+                                                    .send(Message::DataReceived(
+                                                        "✓ Данні відправлені".to_string(),
+                                                    ))
+                                                    .ok();
+                                            }
+                                        }
+                                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                                            // нет команд — продолжим к чтению
+                                        }
+                                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                            // отправитель отключился — завершаем поток
+                                            tx_clone
+                                                .send(Message::DataReceived(
+                                                    "! Канал запису закритий".to_string(),
+                                                ))
+                                                .ok();
+                                            break;
+                                        }
+                                    }
+
+                                    // затем читаем с не очень большим таймаутом (установлен при open)
+                                    match port.read(&mut buf) {
                                         Ok(n) if n > 0 => {
                                             let data =
                                                 String::from_utf8_lossy(&buf[..n]).to_string();
-                                            tx.send(Message::DataReceived(format!(
-                                                "📦 Отримано {} байт",
-                                                n
-                                            )))
-                                            .ok();
-                                            tx.send(Message::DataReceived(data)).ok();
+                                            tx_clone
+                                                .send(Message::DataReceived(format!(
+                                                    "📦 Отримано {} байт",
+                                                    n
+                                                )))
+                                                .ok();
+                                            tx_clone.send(Message::DataReceived(data)).ok();
                                         }
                                         Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
-                                            // просто чекаємо далі
+                                            // просто ожидаем дальше — это кратковременная пауза
                                             continue;
                                         }
                                         Err(e) => {
-                                            // tx.send(Message::PortError(e.to_string())).ok();
-                                            tx.send(Message::DataReceived(format!(
-                                                "⚠️ Помилка читання: {}",
-                                                e
-                                            )))
-                                            .ok();
+                                            tx_clone
+                                                .send(Message::DataReceived(format!(
+                                                    "! Помилка читання: {}",
+                                                    e
+                                                )))
+                                                .ok();
                                             break;
                                         }
                                         _ => {}
                                     }
                                 }
+
+                                // завершение потока — оповестим UI
+                                tx_clone
+                                    .send(Message::DataReceived(
+                                        "🔻 Потік порту завершився".to_string(),
+                                    ))
+                                    .ok();
                             });
 
                             self.terminal_output.push_back(format!(
-                                "✅ Підключен до {} на {} baud",
+                                "✓ Підключений до {} на {} baud",
                                 port_name_clone, self.port_settings.baud_rate
                             ));
                         }
                         Err(e) => {
                             self.terminal_output.push_back(format!(
-                                "❌ Помилка підключення до {}: {}",
+                                "✗ Помилка підключення до {}: {}",
                                 port_name, e
                             ));
                         }
@@ -305,7 +352,7 @@ impl ComTerminal {
                     self.port_settings.connected = false;
                     self.serial_port = None;
                     self.terminal_output
-                        .push_back(format!("🔌 Відключен від {}", port_name));
+                        .push_back(format!("⊗ Відключен від {}", port_name));
                 }
             }
             Message::RefreshPorts => match available_ports() {
@@ -318,14 +365,14 @@ impl ComTerminal {
                 }
                 Err(e) => {
                     self.terminal_output
-                        .push_back(format!("❌ Помилка отримання списку портів: {}", e));
+                        .push_back(format!("✗ Помилка отримання списку портів: {}", e));
                 }
             },
             Message::PortsUpdated(ports) => {
                 self.available_ports = ports;
                 if self.available_ports.is_empty() {
                     self.terminal_output
-                        .push_back("⚠️ COM порти не знайдені".to_string());
+                        .push_back("! COM порти не знайдені".to_string());
                 } else {
                     self.terminal_output.push_back(format!(
                         "📋 Знайдено портів: {}",
@@ -353,19 +400,16 @@ impl ComTerminal {
                     .push_back("=== Лог збережено (симуляція) ===".to_string());
             }
             Message::DataReceived(data) => {
-                self.terminal_output.push_back(format!("📥 {}", data));
+                self.terminal_output.push_back(format!("↓ {}", data));
                 // self.terminal_output.push_back(format!("<- {}", data));
                 self.received_bytes += data.len() as u64;
             }
             Message::PortError(error) => {
                 if let Some(tx) = &self.tx {
-                    tx.send(Message::DataReceived(format!(
-                        "⚠️ Помилка порту: {}",
-                        error
-                    )))
-                    .ok();
+                    tx.send(Message::DataReceived(format!("! Помилка порту: {}", error)))
+                        .ok();
                 }
-                self.terminal_output.push_back(format!("❌ {}", error));
+                self.terminal_output.push_back(format!("✗ {}", error));
             }
         }
     }
@@ -374,8 +418,8 @@ impl ComTerminal {
         let nav_bar = row![
             self.nav_button("🖥️ Термінал", WindowState::Terminal),
             self.nav_button("⚙️ Налаштування", WindowState::Settings),
-            self.nav_button("📊 Моніторинг", WindowState::Monitor),
-            self.nav_button("📁 Файли", WindowState::FileView),
+            self.nav_button("≡ Моніторинг", WindowState::Monitor),
+            self.nav_button("▣ Файли", WindowState::FileView),
         ]
         .spacing(5)
         .padding([10, 20]);
@@ -410,7 +454,7 @@ impl ComTerminal {
     fn terminal_view(&self) -> Element<Message> {
         let status_text = if self.port_settings.connected {
             text(format!(
-                "✅ Підключено до {} ({})",
+                "✓ Підключений до {} ({})",
                 self.port_settings
                     .port_name
                     .as_ref()
@@ -419,7 +463,7 @@ impl ComTerminal {
             ))
             .size(14)
         } else {
-            text("❌ Відключено").size(14)
+            text("✗ Відключено").size(14)
         };
 
         let terminal_display = container(scrollable(
@@ -436,7 +480,7 @@ impl ComTerminal {
         .width(Length::Fill);
 
         let input_row = row![
-            text_input("Введіть команду...", &self.input_text)
+            text_input("Введіть команду...✗", &self.input_text)
                 .on_input(Message::InputChanged)
                 .on_submit(Message::SendData)
                 .width(Length::FillPortion(4)),
@@ -487,9 +531,9 @@ impl ComTerminal {
         .spacing(10);
 
         let connection_controls = if self.port_settings.connected {
-            button("🔌 Відключитися").on_press(Message::DisconnectPort)
+            button("⊗ Відключитися").on_press(Message::DisconnectPort)
         } else {
-            button("🔌 Підключитися").on_press(Message::ConnectPort)
+            button("⊗ Підключитися").on_press(Message::ConnectPort)
         };
 
         let additional_settings = container(
@@ -519,14 +563,14 @@ impl ComTerminal {
     fn monitor_view(&self) -> Element<Message> {
         let stats = container(
             column![
-                text(format!("📤 Відправлено: {} байт", self.sent_bytes)).size(16),
-                text(format!("📥 Отримано: {} байт", self.received_bytes)).size(16),
+                text(format!("↑ Відправлено: {} байт", self.sent_bytes)).size(16),
+                text(format!("↓ Отримано: {} байт", self.received_bytes)).size(16),
                 text(format!(
-                    "📊 Моніторинг: {}",
+                    "≡ Моніторинг: {}",
                     if self.monitoring {
-                        "🟢 Активний"
+                        "● Активний"
                     } else {
-                        "🔴 Зупинений"
+                        "○ Зупинений"
                     }
                 ))
                 .size(16),
@@ -546,17 +590,16 @@ impl ComTerminal {
         .padding(20);
 
         let controls = if self.monitoring {
-            button("⏹️ Зупинити моніторинг").on_press(Message::StopMonitoring)
+            button("■ Зупинити моніторинг").on_press(Message::StopMonitoring)
         } else {
-            button("▶️ Почати моніторинг").on_press(Message::StartMonitoring)
+            button("► Почати моніторинг").on_press(Message::StartMonitoring)
         };
 
-        let chart_placeholder = container(
-            text("📈 Здесь будет график трафика\n(TODO: интеграция с plotters)").size(14),
-        )
-        .padding(30)
-        .height(Length::FillPortion(2))
-        .width(Length::Fill);
+        let chart_placeholder =
+            container(text("↑ Здесь будет график трафика\n(TODO: интеграция с plotters)").size(14))
+                .padding(30)
+                .height(Length::FillPortion(2))
+                .width(Length::Fill);
 
         column![
             text("Моніторинг COM порта").size(24),
@@ -578,8 +621,8 @@ impl ComTerminal {
         .padding(15);
 
         let file_controls = row![
-            button("📁 Відкрити файл").on_press(Message::OpenFile),
-            button("💾 Зберігти лог").on_press(Message::SaveLog),
+            button("▣ Відкрити файл").on_press(Message::OpenFile),
+            button("⎙ Зберігти лог").on_press(Message::SaveLog),
         ]
         .spacing(10);
 
@@ -643,10 +686,14 @@ impl ComTerminal {
 pub fn main() -> iced::Result {
     iced::application("COM Terminal", ComTerminal::update, ComTerminal::view)
         .theme(|_| Theme::Dark)
-        // 🔧 тут підключаємо emoji‑шрифт
-        .font(include_bytes!("../../fonts/NotoColorEmoji.ttf").as_slice())
-        // можна залишити запасний моноширинний
-        .default_font(Font::MONOSPACE)
+        // Emoji fallback (если нужно можно вызывать emoji_font() в виджетах)
+        // .font(include_bytes!("../../fonts/NotoColorEmoji.ttf").as_slice())
+        // fallback монохромный символ/emoji шрифт (seguisym.ttf) — добавьте в папку fonts
+        .font(include_bytes!("../../fonts/seguisym.ttf").as_slice())
+        // Основной шрифт (старые .font(...) с сырыми байтами можно оставить)
+        .font(include_bytes!("../../fonts/jetbrains-mono.regular.ttf").as_slice())
+        // используем функцию вместо проблемного `Font::External { ... }`
+        // .default_font(jetbrains_mono())
         .subscription(ComTerminal::subscription)
         .run_with(|| (ComTerminal::new(), iced::Task::none()))
 }

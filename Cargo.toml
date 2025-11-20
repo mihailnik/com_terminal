@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iced = { version = "0.13.1", features = ["advanced", "async-std", "tokio"] }
+iced = { version = "0.13.1", features = [
+  "advanced",
+  "async-std",
+  "tokio",
+  "image",
+  "svg",
+] }
 serialport = "4.8.1"
 tokio = { version = "1.47.1", features = ["full"] }
 rfd = "0.15.4"
